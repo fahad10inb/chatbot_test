@@ -1,7 +1,7 @@
 from deepgram import DeepgramClient, PrerecordedOptions
 
 # Initialize the Deepgram client
-DEEPGRAM_API_KEY = "0d98d780e5151b9efdca18cd7d9c966626edff88"
+DEEPGRAM_API_KEY = "USE_YOUR_API_KEY"
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 
 def transcribe_audio(audio_data):
