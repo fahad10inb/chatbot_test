@@ -1,0 +1,24 @@
+name: tts_stt_app
+description: A Flutter TTS and STT demo app
+version: 1.0.0
+
+environment:
+  sdk: '>=2.18.0 <3.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^0.13.5
+  record: ^4.4.4
+  audioplayers: ^1.0.1
+  permission_handler: ^10.2.0
+  path_provider: ^2.0.11
+  connectivity_plus: ^3.0.3  # Added for network connectivity checks
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
