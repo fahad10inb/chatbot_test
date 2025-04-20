@@ -1,4 +1,23 @@
-from cartesia import Cartesia
-client = Cartesia(api_key="sk_car_B5tpPKH9mkVGKUvr1bbeYK")
-voices = client.voices.list()
-print(voices)
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv  # Ensure this import is present
+
+# Load environment variables from .env file
+load_dotenv()  # This must be called to load the .env file
+
+# Load the API key from environment variables
+api_key = os.getenv('GEMINI_API_KEY')
+if not api_key:
+    raise ValueError("GEMINI_API_KEY not found in environment variables. Please set it in your .env file.")
+
+# Configure the API client
+genai.configure(api_key=api_key)
+
+# List and print available models
+try:
+    models = genai.list_models()
+    print("Available Gemini models:")
+    for model in models:
+        print(f"- {model.name} (Supported: {model.supported_generation_methods})")
+except Exception as e:
+    print(f"Error checking models: {str(e)}")
