@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=8)
 
 # Initialize the Deepgram client
-DEEPGRAM_API_KEY = "USE_YOUR_API_KEY"
+DEEPGRAM_API_KEY = "0d98d780e5151b9efdca18cd7d9c966626edff88"
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 
 # Create cache directory if it doesn't exist

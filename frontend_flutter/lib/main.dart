@@ -1,27 +1,22 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'dart:convert';
 import 'package:path_provider/path_provider.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:path/path.dart' as path;
 
 // Extension to capitalize strings
 extension StringExtension on String {
-  String capitalize() {
-    if (isEmpty) return this;
-    return '${this[0].toUpperCase()}${substring(1)}';
-  }
+  String capitalize() => isEmpty ? this : '${this[0].toUpperCase()}${substring(1)}';
 }
 
-void main() {
-  runApp(const ChatbotApp());
-}
+void main() => runApp(const ChatbotApp());
 
 class ChatbotApp extends StatelessWidget {
   const ChatbotApp({super.key});
@@ -58,7 +53,7 @@ class Message {
   final bool isUser;
   final DateTime timestamp;
   final String? audioPath;
-  final double? confidence; // Added for STT confidence
+  final double? confidence;
 
   Message({
     required this.text,
@@ -70,73 +65,45 @@ class Message {
 }
 
 class _ChatbotHomePageState extends State<ChatbotHomePage> {
-  // Constant InputDecoration for main TextField
-  static const _textFieldDecoration = InputDecoration(
-    hintText: 'Type a message...',
-    border: InputBorder.none,
-    contentPadding: EdgeInsets.fromLTRB(16.0, 8.0, 16.0, 8.0),
-  );
-
-  // Constant InputDecoration for server IP TextField
-  static const _serverIpDecoration = InputDecoration(
-    labelText: 'Server IP',
-    contentPadding: EdgeInsets.fromLTRB(12.0, 8.0, 12.0, 8.0),
-  );
-
-  // Constant InputDecoration for server port TextField
-  static const _serverPortDecoration = InputDecoration(
-    labelText: 'Server Port',
-    contentPadding: EdgeInsets.fromLTRB(12.0, 8.0, 12.0, 8.0),
-  );
-
-  // Constant InputDecoration for storage path TextField
-  static const _storagePathDecoration = InputDecoration(
-    labelText: 'Storage Path',
-    hintText: 'D:\\your_folder_path',
-    contentPadding: EdgeInsets.fromLTRB(12.0, 8.0, 12.0, 8.0),
-  );
-
-  // Constant colors for connection status indicator
-  static const _connectionBackgroundColor = Color(0xFFFFE0B2); // Colors.orange[100]
-  static const _connectionTextColor = Color(0xFFE65100); // Colors.orange.shade800
-  static const _connectionIconColor = Color(0xFFFF9800); // Colors.orange
-
+  // Constants
+  static const _inputDecorations = _InputDecorations();
+  static const _connectionColors = _ConnectionColors();
+  
+  // Controllers
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
-  final List<Message> _messages = [];
   
+  // State variables
+  final List<Message> _messages = [];
   String _voice = 'default';
   double _speed = 1.0;
   bool _isRecording = false;
   bool _isProcessing = false;
-  String? _errorMessage;
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  final AudioRecorder _recorder = AudioRecorder();
-  String? _audioPath;
   bool _isConnected = true;
   bool _isTyping = false;
+  String? _errorMessage;
+  String? _audioPath;
   
-  // Cache for audio files to prevent duplicate TTS requests
+  // Audio handling
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  final AudioRecorder _recorder = AudioRecorder();
+  
+  // Cache and configuration
   final Map<String, String> _ttsCache = {};
-  
-  // Storage directory - setting D drive path
   String _storagePath = 'D:\\tts_stt_app_files';
-  
-  // Server configuration
   String _serverIP = '127.0.0.1';
   int _serverPort = 5000;
   
-  // Endpoints - compute once to avoid string concatenation in every request
+  // API endpoints
+  late String _serverBaseUrl;
   late String _ttsApiUrl;
   late String _sttApiUrl;
   late String _geminiApiUrl;
-  late String _serverBaseUrl;
-  late String _statusApiUrl; // Added for /api/status
-
-  // Connection check timer
-  Timer? _connectionTimer;
+  late String _statusApiUrl;
   
-  // Cancellable requests
+  // Connection monitoring
+  Timer? _connectionTimer;
+  bool _connectionTestPerformed = false;
   StreamSubscription<ConnectivityResult>? _connectivitySubscription;
 
   @override
@@ -158,7 +125,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     _ttsApiUrl = '$_serverBaseUrl/api/convert';
     _sttApiUrl = '$_serverBaseUrl/api/transcribe';
     _geminiApiUrl = '$_serverBaseUrl/api/gemini';
-    _statusApiUrl = '$_serverBaseUrl/api/status'; // Added for status endpoint
+    _statusApiUrl = '$_serverBaseUrl/api/status';
   }
 
   Future<void> _initializeApp() async {
@@ -173,28 +140,31 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     // Listen for connectivity changes
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen((result) {
       if (result == ConnectivityResult.none) {
-        setState(() {
-          _isConnected = false;
-        });
+        setState(() => _isConnected = false);
       } else {
         _checkServerConnection();
       }
     });
+    
+    // Clean up old files on startup
+    _cleanupOldFiles(silent: true);
   }
 
   Future<void> _setupStorage() async {
     try {
+      // Try D drive first
       final dDriveDir = Directory(_storagePath);
       if (!await dDriveDir.exists()) {
         await dDriveDir.create(recursive: true);
       }
       if (await _isDirectoryWritable(_storagePath)) {
         debugPrint("Using D drive storage path: $_storagePath");
-      } else {
-        throw Exception('D drive storage path is not writable');
+        return;
       }
+      throw Exception('D drive storage path is not writable');
     } catch (e) {
       debugPrint("Error setting up D drive storage: $e");
+      // Try app documents directory
       try {
         final appDir = await getApplicationDocumentsDirectory();
         final appAudioDir = Directory(path.join(appDir.path, 'audio_files'));
@@ -203,22 +173,16 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
         }
         _storagePath = appAudioDir.path;
         debugPrint("Fallback to app directory: $_storagePath");
-        _errorMessage = 'Failed to use D drive. Using app directory instead: $_storagePath';
-      } catch (e2) {
-        try {
-          final tempDir = await getTemporaryDirectory();
-          _storagePath = tempDir.path;
-          debugPrint("Fallback to temp directory: $_storagePath");
-          _errorMessage = 'Failed to use D drive and app directory. Using temp directory: $_storagePath';
-        } catch (e3) {
-          _errorMessage = 'Failed to initialize storage: $e3';
-        }
+        _errorMessage = 'Using app directory: $_storagePath';
+      } catch (_) {
+        // Last resort: use temp directory
+        final tempDir = await getTemporaryDirectory();
+        _storagePath = tempDir.path;
+        debugPrint("Fallback to temp directory: $_storagePath");
+        _errorMessage = 'Using temp directory: $_storagePath';
       }
-      setState(() {}); // Update UI with error message if needed
+      setState(() {});
     }
-    
-    // Clean up old files on startup
-    _cleanupOldFiles(silent: true);
   }
 
   Future<bool> _isDirectoryWritable(String dirPath) async {
@@ -230,7 +194,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
       final testFile = File(path.join(dirPath, 'write_test_${DateTime.now().millisecondsSinceEpoch}.tmp'));
       await testFile.writeAsString('Test write');
       await testFile.delete();
-      debugPrint("Directory is writable: $dirPath");
       return true;
     } catch (e) {
       debugPrint("Directory is not writable: $dirPath, Error: $e");
@@ -242,19 +205,15 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     var connectivityResult = await Connectivity().checkConnectivity();
     bool wasConnected = _isConnected;
     
-    setState(() {
-      _isConnected = connectivityResult != ConnectivityResult.none;
-    });
+    setState(() => _isConnected = connectivityResult != ConnectivityResult.none);
     
     if (_isConnected && (!wasConnected || !_connectionTestPerformed)) {
       await _checkServerConnection();
     }
   }
-  
-  bool _connectionTestPerformed = false;
 
   Future<void> _checkServerConnection() async {
-    if (_isProcessing) return; // Avoid multiple concurrent checks
+    if (_isProcessing) return;
     
     setState(() {
       _isProcessing = true;
@@ -262,29 +221,24 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     });
     
     try {
-      // Use /api/status instead of base URL
       final response = await http.get(Uri.parse(_statusApiUrl))
           .timeout(const Duration(seconds: 3));
-      
-      debugPrint("Server status response: ${response.statusCode}");
       
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         final status = data['status'] ?? 'unknown';
         final services = data['services'] ?? {};
-        final ttsStatus = services['tts'] ?? 'unknown';
-        final sttStatus = services['stt'] ?? 'unknown';
-        final geminiStatus = services['gemini'] ?? 'unknown';
         
         setState(() {
-          _isConnected = status == 'healthy' && ttsStatus == 'ok' && sttStatus == 'ok' && geminiStatus == 'ok';
-          _errorMessage = _isConnected
-              ? null
-              : 'Server status: $status, TTS: $ttsStatus, STT: $sttStatus, Gemini: $geminiStatus';
+          _isConnected = status == 'healthy' && 
+                         services['tts'] == 'ok' && 
+                         services['stt'] == 'ok' && 
+                         services['gemini'] == 'ok';
+          _errorMessage = _isConnected ? null : 'Server services not fully operational';
           _connectionTestPerformed = true;
         });
       } else {
-        throw Exception('Server status check failed: ${response.statusCode}');
+        throw Exception('Status check failed: ${response.statusCode}');
       }
     } catch (e) {
       setState(() {
@@ -292,11 +246,8 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
         _errorMessage = 'Server connection failed: ${e.toString().split('\n')[0]}';
         _connectionTestPerformed = true;
       });
-      debugPrint("Server status check failed: $e");
     } finally {
-      setState(() {
-        _isProcessing = false;
-      });
+      setState(() => _isProcessing = false);
     }
   }
 
@@ -314,7 +265,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
   void _scrollToBottom() {
     if (!_scrollController.hasClients) return;
     
-    // Batch scroll operations to next frame for better performance
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
@@ -340,16 +290,12 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
       final response = await http.post(
         Uri.parse(_geminiApiUrl),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'prompt': message
-        }),
+        body: jsonEncode({'prompt': message}),
       ).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        final responseText = data['response'] ?? 'No response received.';
-        debugPrint("Gemini response: ${responseText.substring(0, responseText.length > 50 ? 50 : responseText.length)}...");
-        return responseText;
+        return data['response'] ?? 'No response received.';
       } else {
         final errorData = jsonDecode(response.body);
         throw Exception('Server error: ${errorData['error'] ?? response.statusCode}');
@@ -359,12 +305,9 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     } on TimeoutException {
       return 'Server request timed out.';
     } catch (e) {
-      debugPrint("Error with Gemini: $e");
-      return 'Error processing request: ${e.toString().split('\n')[0]}';
+      return 'Error: ${e.toString().split('\n')[0]}';
     } finally {
-      setState(() {
-        _isProcessing = false;
-      });
+      setState(() => _isProcessing = false);
     }
   }
 
@@ -404,16 +347,13 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
   Future<void> _convertTextToSpeech([String? textToConvert]) async {
     final text = textToConvert ?? _messages.last.text;
     if (!_isConnected) {
-      setState(() {
-        _errorMessage = 'No internet connection. Please check your network.';
-      });
+      setState(() => _errorMessage = 'No internet connection. Please check your network.');
       return;
     }
 
-    // Check cache first to avoid redundant TTS requests
+    // Check cache first
     final cacheKey = '$text-$_voice-$_speed';
     if (_ttsCache.containsKey(cacheKey)) {
-      debugPrint("Using cached audio: ${_ttsCache[cacheKey]}");
       await _playAudioFile(_ttsCache[cacheKey]!);
       return;
     }
@@ -425,8 +365,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
 
     try {
       await _audioPlayer.stop();
-      
-      debugPrint("Sending TTS request with text: ${text.substring(0, text.length > 50 ? 50 : text.length)}...");
       
       final response = await http.post(
         Uri.parse(_ttsApiUrl),
@@ -447,32 +385,23 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
           await directory.create(recursive: true);
         }
         
-        debugPrint("Saving audio to: $audioFilePath");
         await audioFile.writeAsBytes(response.bodyBytes);
         
         if (await audioFile.exists()) {
-          _ttsCache[cacheKey] = audioFile.path; // Cache the result
+          _ttsCache[cacheKey] = audioFile.path;
           await _playAudioFile(audioFile.path);
-          setState(() {
-            _audioPath = audioFile.path;
-          });
+          setState(() => _audioPath = audioFile.path);
         } else {
           throw Exception('Failed to save audio file');
         }
       } else {
         final errorData = jsonDecode(response.body);
-        debugPrint("TTS API error: ${response.statusCode}, body: ${response.body}");
-        throw Exception('TTS server error: ${errorData['error'] ?? response.statusCode}');
+        throw Exception('TTS error: ${errorData['error'] ?? response.statusCode}');
       }
     } catch (e) {
-      debugPrint("TTS error: $e");
-      setState(() {
-        _errorMessage = 'TTS error: ${e.toString().split('\n')[0]}';
-      });
+      setState(() => _errorMessage = 'TTS error: ${e.toString().split('\n')[0]}');
     } finally {
-      setState(() {
-        _isProcessing = false;
-      });
+      setState(() => _isProcessing = false);
     }
   }
 
@@ -481,7 +410,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
       await _audioPlayer.stop();
       await _audioPlayer.play(DeviceFileSource(audioPath));
     } catch (e) {
-      debugPrint("Error playing audio: $e");
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Error playing audio: ${e.toString().split('\n')[0]}')),
       );
@@ -490,9 +418,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
 
   Future<void> _startRecording() async {
     if (!_isConnected) {
-      setState(() {
-        _errorMessage = 'No internet connection. Please check your network.';
-      });
+      setState(() => _errorMessage = 'No internet connection. Please check your network.');
       return;
     }
 
@@ -511,24 +437,19 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
           await directory.create(recursive: true);
         }
         
-        debugPrint("Starting recording to: $audioFilePath");
-        
         await _recorder.start(const RecordConfig(
           encoder: AudioEncoder.wav,
           bitRate: 128000,
           sampleRate: 44100,
         ), path: audioFilePath);
       } catch (e) {
-        debugPrint("Recording error: $e");
         setState(() {
           _isRecording = false;
           _errorMessage = 'Recording failed: ${e.toString().split('\n')[0]}';
         });
       }
     } else {
-      setState(() {
-        _errorMessage = 'Microphone permission denied';
-      });
+      setState(() => _errorMessage = 'Microphone permission denied');
     }
   }
 
@@ -542,13 +463,11 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
 
     try {
       final recordedPath = await _recorder.stop();
-      debugPrint("Recording stopped, path: $recordedPath");
       
       if (recordedPath != null) {
         _audioPath = recordedPath;
         final audioFile = File(recordedPath);
         if (await audioFile.exists() && await audioFile.length() > 0) {
-          debugPrint("Audio file exists with size: ${await audioFile.length()} bytes");
           await _transcribeAudio(audioFile);
         } else {
           setState(() {
@@ -563,7 +482,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
         });
       }
     } catch (e) {
-      debugPrint("Error stopping recording: $e");
       setState(() {
         _errorMessage = 'Recording error: ${e.toString().split('\n')[0]}';
         _isProcessing = false;
@@ -581,12 +499,8 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     }
 
     try {
-      debugPrint("Transcribing audio from: ${audioFile.path}");
-      
       var request = http.MultipartRequest('POST', Uri.parse(_sttApiUrl));
       request.files.add(await http.MultipartFile.fromPath('audio', audioFile.path));
-      
-      debugPrint("Sending audio file of size: ${await audioFile.length()} bytes");
       
       final streamedResponse = await request.send().timeout(const Duration(seconds: 30));
       final response = await http.Response.fromStream(streamedResponse);
@@ -595,7 +509,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
         final result = jsonDecode(response.body);
         final transcript = result['transcript'] ?? '';
         final confidence = result['confidence'] ?? 0.0;
-        debugPrint("Received transcript: $transcript, confidence: $confidence");
         
         if (transcript.isNotEmpty && transcript != 'No speech detected, please try again.') {
           setState(() {
@@ -623,30 +536,22 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
           _scrollToBottom();
           await _convertTextToSpeech(geminiResponse);
         } else {
-          setState(() {
-            _errorMessage = transcript.isEmpty ? 'Could not transcribe audio. Please try again.' : transcript;
-          });
+          setState(() => _errorMessage = transcript.isEmpty ? 
+              'Could not transcribe audio. Please try again.' : transcript);
         }
       } else {
         final errorData = jsonDecode(response.body);
-        debugPrint("STT API error: ${response.statusCode}, body: ${response.body}");
-        throw Exception('STT server error: ${errorData['error'] ?? response.statusCode}');
+        throw Exception('STT error: ${errorData['error'] ?? response.statusCode}');
       }
     } catch (e) {
-      debugPrint("Transcription error: $e");
-      setState(() {
-        _errorMessage = 'Transcription error: ${e.toString().split('\n')[0]}';
-      });
+      setState(() => _errorMessage = 'Transcription error: ${e.toString().split('\n')[0]}');
     } finally {
-      setState(() {
-        _isProcessing = false;
-      });
+      setState(() => _isProcessing = false);
     }
   }
 
   Future<void> _testServerConnection() async {
     await _checkServerConnection();
-    
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(_isConnected ? 'Server is online' : 'Server is offline: $_errorMessage')),
     );
@@ -660,7 +565,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
         final now = DateTime.now();
         int deletedCount = 0;
         
-        // Use batch deletion for better performance
         List<Future<void>> deletionFutures = [];
         
         for (var file in files) {
@@ -673,7 +577,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
           }
         }
         
-        // Wait for all deletions to complete
         await Future.wait(deletionFutures);
         
         if (!silent && deletedCount > 0) {
@@ -686,7 +589,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
           );
         }
         
-        // Also clean up the cache if it's getting too large
         if (_ttsCache.length > 50) {
           _ttsCache.clear();
         }
@@ -700,6 +602,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     }
   }
 
+  // UI Dialog methods
   Future<void> _updateServerConfig() async {
     await showDialog(
       context: context,
@@ -712,11 +615,11 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(
-                decoration: _serverIpDecoration,
+                decoration: _inputDecorations.serverIp,
                 controller: ipController,
               ),
               TextField(
-                decoration: _serverPortDecoration,
+                decoration: _inputDecorations.serverPort,
                 controller: portController,
                 keyboardType: TextInputType.number,
               ),
@@ -762,7 +665,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(
-                decoration: _storagePathDecoration,
+                decoration: _inputDecorations.storagePath,
                 controller: pathController,
               ),
               const SizedBox(height: 10),
@@ -773,10 +676,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
             ],
           ),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancel'),
-            ),
+            TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
             TextButton(
               onPressed: () async {
                 final newPath = pathController.text.trim();
@@ -791,9 +691,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                     await dir.create(recursive: true);
                   }
                   if (await _isDirectoryWritable(newPath)) {
-                    setState(() {
-                      _storagePath = newPath;
-                    });
+                    setState(() => _storagePath = newPath);
                     _cleanupOldFiles(silent: true);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(content: Text('Storage path updated to $newPath')),
@@ -837,9 +735,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                     value: tempVoice,
                     onChanged: (value) {
                       if (value != null) {
-                        setState(() {
-                          tempVoice = value;
-                        });
+                        setState(() => tempVoice = value);
                       }
                     },
                     items: ['default', 'male', 'female']
@@ -860,11 +756,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                           max: 2.0,
                           divisions: 15,
                           label: tempSpeed.toStringAsFixed(1),
-                          onChanged: (value) {
-                            setState(() {
-                              tempSpeed = value;
-                            });
-                          },
+                          onChanged: (value) => setState(() => tempSpeed = value),
                         ),
                       ),
                       Text(tempSpeed.toStringAsFixed(1)),
@@ -879,7 +771,6 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                 ),
                 TextButton(
                   onPressed: () {
-                    // Only update if values changed, to prevent unnecessary rebuilds
                     if (tempVoice != _voice || tempSpeed != _speed) {
                       this.setState(() {
                         _voice = tempVoice;
@@ -898,7 +789,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
     );
   }
 
-  // Optimized message tile builder for better performance
+  // UI components
   Widget _buildMessageTile(Message message) {
     return Align(
       alignment: message.isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -973,6 +864,20 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
       ),
     );
   }
+  
+  Widget _buildDot(int index) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeInOut,
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: (math.sin((value * 2 * math.pi) + (index * 0.5)) + 1) / 2,
+          child: const Text('•', style: TextStyle(fontSize: 20)),
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1014,12 +919,7 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                 children: [
                   const Icon(Icons.error_outline, color: Colors.red),
                   const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _errorMessage!,
-                      style: const TextStyle(color: Colors.red),
-                    ),
-                  ),
+                  Expanded(child: Text(_errorMessage!, style: const TextStyle(color: Colors.red))),
                   IconButton(
                     icon: const Icon(Icons.close, size: 16),
                     onPressed: () => setState(() => _errorMessage = null),
@@ -1029,43 +929,51 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                 ],
               ),
             ),
-          
-          // Connection status indicator
-          if (!_isConnected)
-            Container(
-              padding: const EdgeInsets.all(8.0),
-              color: _connectionBackgroundColor,
-              width: double.infinity,
-              child: Row(
-                children: [
-                  const Icon(Icons.wifi_off, color: _connectionIconColor),
-                  const SizedBox(width: 8),
-                  const Text(
-                    'No connection to server. Check network settings.',
-                    style: TextStyle(color: _connectionTextColor),
+// Connection status indicator
+          Container(
+            color: _isConnected ? _connectionColors.online : _connectionColors.offline,
+            padding: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 8.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _isConnected ? Icons.cloud_done : Icons.cloud_off,
+                  size: 16,
+                  color: Colors.white,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  _isConnected ? 'Server Connected' : 'Server Disconnected',
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _testServerConnection,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  const Spacer(),
-                  TextButton(
-                    onPressed: _testServerConnection,
-                    child: const Text('Retry'),
-                    style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      minimumSize: const Size(0, 24),
-                    ),
+                  child: const Text(
+                    'Test Connection',
+                    style: TextStyle(color: Colors.white, fontSize: 12),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
+          ),
           
-          // Chat messages
+          // Messages list
           Expanded(
             child: ListView.builder(
               controller: _scrollController,
-              padding: const EdgeInsets.all(16.0),
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
               itemCount: _messages.length + (_isTyping ? 1 : 0),
               itemBuilder: (context, index) {
-                if (index == _messages.length && _isTyping) {
-                  // Show typing indicator
+                if (index < _messages.length) {
+                  return _buildMessageTile(_messages[index]);
+                } else {
+                  // Typing indicator
                   return Align(
                     alignment: Alignment.centerLeft,
                     child: Container(
@@ -1078,108 +986,126 @@ class _ChatbotHomePageState extends State<ChatbotHomePage> {
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Text('Typing'),
-                          const SizedBox(width: 8),
-                          SizedBox(
-                            width: 30,
-                            child: Stack(
-                              children: [
-                                Positioned(
-                                  left: 0,
-                                  child: _buildDot(0),
-                                ),
-                                Positioned(
-                                  left: 10,
-                                  child: _buildDot(1),
-                                ),
-                                Positioned(
-                                  left: 20,
-                                  child: _buildDot(2),
-                                ),
-                              ],
-                            ),
-                          ),
+                          _buildDot(0),
+                          _buildDot(1),
+                          _buildDot(2),
                         ],
                       ),
                     ),
                   );
                 }
-                return _buildMessageTile(_messages[index]);
               },
             ),
           ),
           
           // Input area
           Container(
+            padding: const EdgeInsets.all(8.0),
             decoration: BoxDecoration(
-              color: Theme.of(context).cardColor,
-              boxShadow: [
-                BoxShadow(
-                  offset: const Offset(0, -2),
-                  blurRadius: 4.0,
-                  color: Colors.black.withOpacity(0.1),
+              color: Theme.of(context).primaryColor.withOpacity(0.05),
+              border: Border(
+                top: BorderSide(
+                  color: Theme.of(context).dividerColor,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    decoration: _inputDecorations.messageInput,
+                    textCapitalization: TextCapitalization.sentences,
+                    enabled: !_isProcessing && _isConnected,
+                    onSubmitted: (text) {
+                      if (text.trim().isNotEmpty) {
+                        _sendMessage(text);
+                      }
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: !_isProcessing && _isConnected
+                      ? () {
+                          final text = _messageController.text;
+                          if (text.trim().isNotEmpty) {
+                            _sendMessage(text);
+                          }
+                        }
+                      : null,
+                  tooltip: 'Send Message',
+                ),
+                const SizedBox(width: 8),
+                FloatingActionButton(
+                  onPressed: _isProcessing || !_isConnected
+                      ? null
+                      : _isRecording
+                          ? _stopRecording
+                          : _startRecording,
+                  backgroundColor: _isRecording
+                      ? Colors.red
+                      : _isProcessing || !_isConnected
+                          ? Colors.grey
+                          : Theme.of(context).primaryColor,
+                  mini: true,
+                  child: Icon(
+                    _isRecording ? Icons.stop : Icons.mic,
+                    color: Colors.white,
+                  ),
+                  tooltip: _isRecording ? 'Stop Recording' : 'Start Recording',
                 ),
               ],
-            ),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _messageController,
-                      decoration: _textFieldDecoration,
-                      textCapitalization: TextCapitalization.sentences,
-                      keyboardType: TextInputType.multiline,
-                      maxLines: null,
-                      enabled: !_isProcessing && _isConnected,
-                      onSubmitted: (value) {
-                        if (value.trim().isNotEmpty) {
-                          _sendMessage(value);
-                        }
-                      },
-                    ),
-                  ),
-                  IconButton(
-                    icon: Icon(_isRecording ? Icons.stop : Icons.mic),
-                    onPressed: _isProcessing || !_isConnected
-                        ? null
-                        : (_isRecording ? _stopRecording : _startRecording),
-                    color: _isRecording ? Colors.red : null,
-                    tooltip: _isRecording ? 'Stop Recording' : 'Start Recording',
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.send),
-                    onPressed: (_isProcessing || _messageController.text.trim().isEmpty || !_isConnected)
-                        ? null
-                        : () => _sendMessage(_messageController.text),
-                    tooltip: 'Send Message',
-                  ),
-                ],
-              ),
             ),
           ),
           
           // Processing indicator
-          if (_isProcessing && !_isRecording)
-            const LinearProgressIndicator(),
+          if (_isProcessing)
+            LinearProgressIndicator(
+              backgroundColor: Colors.transparent,
+              color: Theme.of(context).primaryColor,
+            ),
         ],
       ),
     );
   }
-  
-  // Animated typing indicator dot
-  Widget _buildDot(int index) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 0.0, end: 1.0),
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeInOut,
-      builder: (context, value, child) {
-        return Opacity(
-          opacity: (math.sin((value * 2 * math.pi) + (index * 0.5)) + 1) / 2,
-          child: const Text('•', style: TextStyle(fontSize: 20)),
-        );
-      },
-    );
-  }
 }
+
+// Helper classes for constants
+class _ConnectionColors {
+  final Color online = Colors.green;
+  final Color offline = Colors.red;
+  
+  const _ConnectionColors();
+}
+
+class _InputDecorations {
+  final InputDecoration messageInput = const InputDecoration(
+    hintText: 'Type a message...',
+    border: OutlineInputBorder(
+      borderRadius: BorderRadius.all(Radius.circular(24.0)),
+      borderSide: BorderSide.none,
+    ),
+    filled: true,
+    contentPadding: EdgeInsets.symmetric(vertical: 10.0, horizontal: 20.0),
+  );
+  
+  final InputDecoration serverIp = const InputDecoration(
+    labelText: 'Server IP',
+    hintText: '127.0.0.1',
+  );
+  
+  final InputDecoration serverPort = const InputDecoration(
+    labelText: 'Server Port',
+    hintText: '5000',
+  );
+  
+  final InputDecoration storagePath = const InputDecoration(
+    labelText: 'Storage Path',
+    hintText: 'D:\\tts_stt_app_files',
+  );
+  
+  const _InputDecorations();
+}         
+          //

@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 logger = logging.getLogger(__name__)
 
 # Create thread pool for parallel processing - shared with app.py
-executor = ThreadPoolExecutor(max_workers=8)  # Increased from 4 to match stt.py
+executor = ThreadPoolExecutor(max_workers=16)  # Increased from 4 to match stt.py
 
 # Get API key with better error handling
 api_key = os.environ.get("CARTESIA_API_KEY")
@@ -55,21 +55,23 @@ SPEED_MAPPING = {
 }
 SPEED_VALUES = sorted(SPEED_MAPPING.keys())
 
-def text_to_speech(text, voice="default", speed=1.0):
+# In tts.py
+def text_to_speech(text, voice="default", speed=1.0, streaming=False):
     """
-    Convert text to speech using Cartesia API with improved caching.
+    Convert text to speech using Cartesia API with improved caching and streaming support.
     
     Args:
         text (str): The text to convert to speech.
         voice (str): The voice to use ("default", "male", or "female").
         speed (float): The speed of speech (0.5 to 2.0).
+        streaming (bool): Whether to return a streaming response.
         
     Returns:
-        bytes: The audio data.
+        bytes or generator: The audio data or a generator yielding audio chunks.
     """
     try:
         start_time = time.time()
-        logger.debug(f"TTS request: text='{text[:50]}...', voice={voice}, speed={speed}")
+        logger.debug(f"TTS request: text='{text[:50]}...', voice={voice}, speed={speed}, streaming={streaming}")
         
         # Input validation
         if not isinstance(text, str) or not text.strip():
@@ -87,6 +89,9 @@ def text_to_speech(text, voice="default", speed=1.0):
         full_cache_key = hashlib.md5(f"{text}:{voice}:{speed}".encode()).hexdigest()
         cache_path = os.path.join(cache_dir, f"{full_cache_key}.wav")
         
+        # For streaming requests, we'll still check cache first
+        # If found in cache, we can send the entire file as a stream
+        
         # Check memory cache first (fastest) with thread safety
         with memory_cache_lock:
             if memory_cache_key in memory_cache:
@@ -95,7 +100,14 @@ def text_to_speech(text, voice="default", speed=1.0):
                     logger.debug(f"Found in-memory cached audio for: {text[:20]}...")
                     # Update timestamp to keep frequently used items fresh
                     memory_cache[memory_cache_key]['timestamp'] = time.time()
-                    return cached_entry['audio_data']
+                    
+                    if streaming:
+                        # For streaming, return a generator that yields the cached data
+                        def yield_cached():
+                            yield cached_entry['audio_data']
+                        return yield_cached()
+                    else:
+                        return cached_entry['audio_data']
         
         # Then check file cache
         if os.path.exists(cache_path):
@@ -115,8 +127,14 @@ def text_to_speech(text, voice="default", speed=1.0):
                     # Remove oldest entry
                     oldest_key = min(memory_cache.keys(), key=lambda k: memory_cache[k]['timestamp'])
                     del memory_cache[oldest_key]
-                    
-            return audio_data
+            
+            if streaming:
+                # For streaming, return a generator that yields the cached data
+                def yield_cached_file():
+                    yield audio_data
+                return yield_cached_file()
+            else:
+                return audio_data
         
         # If not in cache, generate new audio
         # Get voice ID from mapping
@@ -130,69 +148,109 @@ def text_to_speech(text, voice="default", speed=1.0):
         
         # Add timeout handling
         try:
-            audio_data = client.tts.bytes(
-                model_id="sonic-2",
-                transcript=text,
-                voice={"mode": "id", "id": selected_voice, "experimental_controls": {"speed": speed_setting}},
-                language="en",
-                output_format={"container": "wav", "encoding": "pcm_f32le", "sample_rate": 44100}
-            )
+            # If streaming is requested, handle differently
+            if streaming:
+                # For streaming, use the generator directly from Cartesia
+                audio_stream = client.tts.stream(
+                    model_id="sonic-2",
+                    transcript=text,
+                    voice={"mode": "id", "id": selected_voice, "experimental_controls": {"speed": speed_setting}},
+                    language="en",
+                    output_format={"container": "wav", "encoding": "pcm_f32le", "sample_rate": 44100}
+                )
+                
+                # Create a buffered wrapper around the stream to collect chunks for caching
+                chunks = []
+                
+                def buffered_stream():
+                    for chunk in audio_stream:
+                        chunks.append(chunk)
+                        yield chunk
+                    
+                    # After streaming completes, save to cache in background
+                    def save_to_cache():
+                        audio_data = b"".join(chunks)
+                        if audio_data and len(audio_data) >= 100:
+                            # Save to file cache
+                            with open(cache_path, "wb") as f:
+                                f.write(audio_data)
+                            
+                            # Update memory cache
+                            with memory_cache_lock:
+                                memory_cache[memory_cache_key] = {
+                                    'audio_data': audio_data,
+                                    'timestamp': time.time()
+                                }
+                    
+                    # Submit cache saving as a background task
+                    executor.submit(save_to_cache)
+                
+                return buffered_stream()
+            else:
+                # For non-streaming, get complete bytes
+                audio_data = client.tts.bytes(
+                    model_id="sonic-2",
+                    transcript=text,
+                    voice={"mode": "id", "id": selected_voice, "experimental_controls": {"speed": speed_setting}},
+                    language="en",
+                    output_format={"container": "wav", "encoding": "pcm_f32le", "sample_rate": 44100}
+                )
         except Exception as e:
             logger.error(f"Error calling Cartesia TTS API: {e}", exc_info=True)
             raise Exception(f"TTS API error: {str(e)}")
         
-        # Process response
-        logger.debug(f"Received audio_data type: {type(audio_data)}")
-        if isinstance(audio_data, types.GeneratorType):
-            logger.debug("Combining audio chunks from generator")
-            # Combine chunks with progress tracking
-            chunks = []
-            chunk_count = 0
-            total_bytes = 0
+        # For non-streaming mode, process the response
+        if not streaming:
+            logger.debug(f"Received audio_data type: {type(audio_data)}")
+            if isinstance(audio_data, types.GeneratorType):
+                logger.debug("Combining audio chunks from generator")
+                # Combine chunks with progress tracking
+                chunks = []
+                chunk_count = 0
+                total_bytes = 0
+                
+                for chunk in audio_data:
+                    if isinstance(chunk, bytes):
+                        chunks.append(chunk)
+                        chunk_count += 1
+                        total_bytes += len(chunk)
+                        
+                audio_data = b"".join(chunks)
+                logger.debug(f"Combined {chunk_count} chunks, total size: {total_bytes} bytes")
+            elif not isinstance(audio_data, bytes):
+                raise TypeError(f"Expected bytes or generator, got {type(audio_data)}")
             
-            for chunk in audio_data:
-                if isinstance(chunk, bytes):
-                    chunks.append(chunk)
-                    chunk_count += 1
-                    total_bytes += len(chunk)
-                    
-            audio_data = b"".join(chunks)
-            logger.debug(f"Combined {chunk_count} chunks, total size: {total_bytes} bytes")
-        elif not isinstance(audio_data, bytes):
-            raise TypeError(f"Expected bytes or generator, got {type(audio_data)}")
-        
-        # Validate audio data
-        if not audio_data or len(audio_data) < 100:
-            raise ValueError("Received empty or invalid audio data from TTS API")
+            # Validate audio data
+            if not audio_data or len(audio_data) < 100:
+                raise ValueError("Received empty or invalid audio data from TTS API")
+                
+            # Save to cache for future use
+            with open(cache_path, "wb") as f:
+                f.write(audio_data)
             
-        # Save to cache for future use
-        with open(cache_path, "wb") as f:
-            f.write(audio_data)
-        
-        # Update memory cache with thread safety
-        with memory_cache_lock:
-            memory_cache[memory_cache_key] = {
-                'audio_data': audio_data,
-                'timestamp': time.time()
-            }
+            # Update memory cache with thread safety
+            with memory_cache_lock:
+                memory_cache[memory_cache_key] = {
+                    'audio_data': audio_data,
+                    'timestamp': time.time()
+                }
+                
+                # Clean memory cache if too large
+                if len(memory_cache) > MEMORY_CACHE_SIZE:
+                    # Remove oldest entries (more aggressive cleanup)
+                    keys_by_age = sorted(memory_cache.keys(), key=lambda k: memory_cache[k]['timestamp'])
+                    for old_key in keys_by_age[:max(1, len(keys_by_age)//10)]:  # Remove ~10% of oldest entries
+                        del memory_cache[old_key]
             
-            # Clean memory cache if too large
-            if len(memory_cache) > MEMORY_CACHE_SIZE:
-                # Remove oldest entries (more aggressive cleanup)
-                keys_by_age = sorted(memory_cache.keys(), key=lambda k: memory_cache[k]['timestamp'])
-                for old_key in keys_by_age[:max(1, len(keys_by_age)//10)]:  # Remove ~10% of oldest entries
-                    del memory_cache[old_key]
-        
-        # Report timing
-        processing_time = time.time() - start_time
-        logger.debug(f"TTS conversion completed in {processing_time:.2f}s, audio size: {len(audio_data)} bytes")
-        
-        return audio_data
+            # Report timing
+            processing_time = time.time() - start_time
+            logger.debug(f"TTS conversion completed in {processing_time:.2f}s, audio size: {len(audio_data)} bytes")
+            
+            return audio_data
     
     except Exception as e:
         logger.error(f"TTS conversion failed: {str(e)}", exc_info=True)
         raise
-
 # Add a cleanup function that can be called by app.py
 def cleanup_old_cache_files(max_age_seconds=86400):  # Default to 24 hours
     """Clean up old cache files"""

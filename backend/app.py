@@ -11,6 +11,12 @@ from dotenv import load_dotenv
 import os
 import google.generativeai as genai
 import re
+from collections import defaultdict
+
+# Add this after your existing global variables
+# Store conversation history keyed by some identifier (could be session ID or user ID)
+conversation_histories = defaultdict(list)
+MAX_HISTORY_LENGTH = 10  # Limit history to prevent tokens getting too large
 
 # Configure logging
 logging.basicConfig(
@@ -68,7 +74,8 @@ def convert_text():
         text = data.get('text', '')
         voice = data.get('voice', 'default')
         speed = float(data.get('speed', 1.0))
-        logger.debug(f"[{req_id}] TTS parameters: text={text[:20]}..., voice={voice}, speed={speed}")
+        streaming = data.get('streaming', False)  # New parameter for streaming
+        logger.debug(f"[{req_id}] TTS parameters: text={text[:20]}..., voice={voice}, speed={speed}, streaming={streaming}")
         
         if not text:
             return jsonify({"error": "Text is required"}), 400
@@ -79,6 +86,24 @@ def convert_text():
         if voice.lower() not in valid_voices:
             return jsonify({"error": f"Voice must be one of: {', '.join(valid_voices)}"}), 400
         
+        # For streaming mode, we handle differently
+        if streaming:
+            try:
+                # Get streaming generator from TTS function
+                audio_stream = text_to_speech(text, voice, speed, streaming=True)
+                
+                # Return a streaming response
+                return app.response_class(
+                    audio_stream,
+                    mimetype='audio/wav',
+                    headers={'Content-Disposition': 'attachment; filename=speech.wav'}
+                )
+                
+            except Exception as tts_error:
+                logger.error(f"[{req_id}] TTS streaming error: {str(tts_error)}", exc_info=True)
+                return jsonify({"error": f"TTS streaming failed: {str(tts_error)}"}), 500
+        
+        # For non-streaming mode, continue with existing code
         # Check cache first for faster response
         cache_key = f"tts:{text[:100]}:{voice}:{speed}"
         if cache_key in response_cache:
@@ -97,7 +122,7 @@ def convert_text():
         
         try:
             # Submit TTS task to thread pool
-            future = executor.submit(text_to_speech, text, voice, speed)
+            future = executor.submit(text_to_speech, text, voice, speed, False)
             # Add small timeout for better error handling
             audio_data = future.result(timeout=15)
             
@@ -192,6 +217,7 @@ def transcribe():
             del active_requests[req_id]
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/api/gemini', methods=['POST'])
 def gemini_endpoint():
     req_id = get_request_id()
@@ -208,9 +234,17 @@ def gemini_endpoint():
         if not prompt:
             logger.warning(f"[{req_id}] No prompt provided")
             return jsonify({"error": "No prompt provided"}), 400
-
-        # Optimization: Check cache first
-        cache_key = f"gemini:{prompt[:150]}"
+            
+        # Get user identifier - could be IP address, session ID, or something provided in request
+        # For simplicity, we'll use IP address in this example
+        user_id = request.remote_addr
+        
+        # Check if this is a new conversation (optional reset mechanism)
+        if data.get('reset_conversation', False):
+            conversation_histories[user_id] = []
+            
+        # Optimization: Check cache first for exact same prompt (less useful with conversation history)
+        cache_key = f"gemini:{user_id}:{prompt[:100]}"
         if cache_key in response_cache:
             cache_entry = response_cache[cache_key]
             if time.time() - cache_entry['timestamp'] < CACHE_EXPIRY:
@@ -224,15 +258,26 @@ def gemini_endpoint():
         
         Do not use asterisks, special characters, or emojis. Maintain a conversational, helpful tone as if you're speaking
         directly to the person. Answer questions directly without unnecessary preamble.
+        
+        Consider the conversation history when responding. Make your response relevant to the entire conversation,
+        not just the most recent message.
         """
         
-        # Combine system instruction with user prompt
-        full_prompt = f"{system_instruction}\n\nUser query: {prompt}"
+        # Build conversation history prompt
+        conversation_prompt = system_instruction + "\n\nConversation history:\n"
         
-        logger.debug(f"[{req_id}] Generating content with prompt: {prompt[:50]}...")
+        # Add previous exchanges from history
+        for i, (old_prompt, old_response) in enumerate(conversation_histories[user_id]):
+            conversation_prompt += f"User: {old_prompt}\n"
+            conversation_prompt += f"Assistant: {old_response}\n"
+        
+        # Add current prompt
+        conversation_prompt += f"\nUser: {prompt}\nAssistant:"
+        
+        logger.debug(f"[{req_id}] Generating content with conversation history (total exchanges: {len(conversation_histories[user_id])})")
         model = genai.GenerativeModel('gemini-2.0-flash')
         response = model.generate_content(
-            full_prompt,
+            conversation_prompt,
             generation_config={
                 "temperature": 0.2,
                 "max_output_tokens": 400,  # Reduced for even shorter responses
@@ -245,6 +290,13 @@ def gemini_endpoint():
         
         # Remove asterisks if any still appear
         result_text = result_text.replace('*', '')
+        
+        # Store in conversation history
+        conversation_histories[user_id].append((prompt, result_text))
+        
+        # Limit history size to prevent token overflow
+        if len(conversation_histories[user_id]) > MAX_HISTORY_LENGTH:
+            conversation_histories[user_id] = conversation_histories[user_id][-MAX_HISTORY_LENGTH:]
         
         # Update cache
         response_cache[cache_key] = {
@@ -272,7 +324,7 @@ def gemini_endpoint():
         if req_id in active_requests:
             del active_requests[req_id]
         return jsonify({"error": f"Failed to get Gemini response: {str(e)}"}), 500
-
+    
 @app.route('/api/status', methods=['GET'])
 def api_status():
     """Provides status information about the API services."""
